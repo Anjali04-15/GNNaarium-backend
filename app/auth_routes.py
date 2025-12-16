@@ -66,6 +66,8 @@ async def google_login(request: Request, redirect_to: str = None):
 
 @router.get("/auth/google/callback", name="google_callback")
 async def google_callback(request: Request):
+    FRONTEND_FALLBACK = "http://localhost:3000"
+    redirect_to = FRONTEND_FALLBACK
     try:
         if 'error' in request.query_params:
             raise HTTPException(
@@ -134,8 +136,15 @@ async def google_callback(request: Request):
             }
 
         import base64, json
-        state = request.query_params.get('state')
-        redirect_to = base64.b64decode(state).decode() if state else None
+        state = request.query_params.get("state")
+
+        if state:
+            try:
+                decoded = base64.b64decode(state).decode()
+                if decoded.startswith("http"):
+                    redirect_to = decoded
+            except Exception:
+                pass
 
         if not redirect_to or not redirect_to.startswith("http"):
             raise HTTPException(status_code=400, detail="Invalid redirect URL")
@@ -146,7 +155,9 @@ async def google_callback(request: Request):
         return RedirectResponse(url=redirect_url)
 
     except Exception as e:
-        return RedirectResponse(url=f"{redirect_to}?error={str(e)}")
+        return RedirectResponse(
+            url=f"{FRONTEND_FALLBACK}?error={str(e)}"
+        )
 
 @router.post("/auth/logout")
 async def logout():
