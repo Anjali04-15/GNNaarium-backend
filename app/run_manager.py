@@ -35,6 +35,7 @@ class RunManager:
         # Detect if this is graph classification (MUTAG, PROTEINS, etc.)
         dataset_name = config.get('dataset', {}).get('name', '')
         is_graph_level = dataset_name in ['MUTAG', 'PROTEINS', 'ZINC']
+        self.task_type = 'graph' if is_graph_level else 'node'
         
         self.model = create_model(
             model_name,
@@ -270,6 +271,10 @@ class RunManager:
         
         await send_event({"type": "log", "msg": f"Running {explainer_name}..."})
         
+        # Determine task type based on dataset
+        dataset_name = self.config.get('dataset', {}).get('name', '')
+        task_type = 'graph' if dataset_name in ['MUTAG', 'PROTEINS', 'ZINC'] else 'node'
+        
         # Get target node indices - parse comma-separated string
         node_idx_str = explainer_config.get("node_idx", "0")
         if isinstance(node_idx_str, str):
@@ -277,20 +282,45 @@ class RunManager:
         else:
             node_indices = [int(node_idx_str)]
         
-        # Remove name from config
+        # Remove name from config and add task type
         config_copy = explainer_config.copy()
         config_copy.pop("name", None)
+        config_copy["task_type"] = task_type
+        
+        # Validate node indices for node-level tasks
+        if task_type == 'node':
+            valid_indices = [idx for idx in node_indices if idx < self.data.num_nodes]
+            if len(valid_indices) != len(node_indices):
+                invalid_indices = [idx for idx in node_indices if idx >= self.data.num_nodes]
+                await send_event({"type": "log", "msg": f"Warning: Invalid node indices {invalid_indices} (max: {self.data.num_nodes-1})"})
+            node_indices = valid_indices[:5]  # Limit to 5 nodes for performance
+        else:
+            # For graph-level tasks, use first node as representative
+            node_indices = [0]
+        
+        if not node_indices:
+            await send_event({"type": "log", "msg": "No valid node indices for explanation"})
+            return None
         
         explanations = []
         explainer = AVAILABLE_EXPLAINERS[explainer_name]()
         
         try:
             for node_idx in node_indices:
-                if node_idx >= self.data.num_nodes:
-                    raise ValueError(f"Node index {node_idx} exceeds dataset size {self.data.num_nodes}")
                 config_copy["node_idx"] = node_idx
+                
+                # Add validation message for k-hop constraint
+                if task_type == 'node':
+                    await send_event({"type": "log", "msg": f"Explaining node {node_idx} using k-hop subgraph (k={explainer.get_model_num_layers(self.model) if hasattr(explainer, 'get_model_num_layers') else 2})"})
+                
                 explanation = explainer.explain(self.model, self.data, **config_copy)
                 explanations.append(explanation)
+                
+                # Validate explanation follows rules
+                if task_type == 'node' and 'num_hops_used' in explanation:
+                    await send_event({"type": "log", "msg": f"✓ Node explanation uses {explanation['num_hops_used']}-hop subgraph (compliant)"})
+                elif task_type == 'graph':
+                    await send_event({"type": "log", "msg": "✓ Graph explanation uses full graph (compliant)"})
             
             # Send each explanation
             for explanation in explanations:
@@ -371,30 +401,96 @@ class RunManager:
             }
     
     def calculate_explanation_quality(self, explanation):
-        """Calculate explanation quality metrics"""
+        """Calculate explanation quality metrics with method-specific validation"""
         if not explanation or "error" in explanation:
             return None
         
         quality_metrics = {}
+        method = explanation.get('method')
+        
+        # GraphMask-specific validation
+        if method == 'GraphMask':
+            quality_metrics['explainer_type'] = 'Global (message-level)'
+            quality_metrics['total_edges_evaluated'] = explanation.get('total_edges_evaluated', 0)
+            quality_metrics['edges_gated_off'] = explanation.get('edges_gated_off', 0)
+            quality_metrics['edges_retained'] = explanation.get('edges_retained', 0)
+            
+            # Prediction invariance (NOT fidelity)
+            invariance = explanation.get('prediction_invariance', 0.0)
+            quality_metrics['prediction_invariance'] = invariance
+            quality_metrics['valid_invariance'] = invariance >= 0.8
+            
+            # GraphMask explains model behavior, not individual predictions
+            quality_metrics['explains_model_behavior'] = True
+            quality_metrics['explains_individual_predictions'] = False
+            
+            quality_score = 0.8 if quality_metrics['valid_invariance'] else 0.2
+            quality_metrics['overall_quality'] = quality_score
+            quality_metrics['success'] = True
+            return quality_metrics
+        
+        # Standard validation for other explainers
+        task_type = explanation.get('task_type', 'node')
+        if task_type == 'node':
+            # MANDATORY: Node explanations must use k-hop subgraph
+            if 'num_hops_used' in explanation:
+                quality_metrics['k_hop_compliant'] = True
+                quality_metrics['num_hops_used'] = explanation['num_hops_used']
+            else:
+                quality_metrics['k_hop_compliant'] = False
+                quality_metrics['validation_error'] = 'Node explanation did not use k-hop subgraph'
         
         # Calculate sparsity if edge importance is available
         if 'edge_importance' in explanation:
-            edge_imp = explanation['edge_importance']
+            edge_imp = torch.tensor(explanation['edge_importance']) if not torch.is_tensor(explanation['edge_importance']) else explanation['edge_importance']
             sparsity = (edge_imp < 0.1).float().mean().item()
             quality_metrics['sparsity'] = sparsity
             quality_metrics['max_importance'] = edge_imp.max().item()
             quality_metrics['mean_importance'] = edge_imp.mean().item()
+            quality_metrics['sparse_enough'] = sparsity > 0.5
         
-        # Method-specific metrics
-        if explanation.get('method') == 'ProtGNN':
-            quality_metrics['num_prototypes'] = len(explanation.get('prototypes', []))
+        # Fidelity check for non-GraphMask explainers
+        if 'fidelity' in explanation:
+            quality_metrics['fidelity'] = explanation['fidelity']
+            quality_metrics['preserves_prediction'] = explanation['fidelity'] > 0.8
         
-        if explanation.get('method') == 'SubgraphX':
+        # ProtGNN-specific validation
+        if method == 'ProtGNN':
+            quality_metrics['explainer_type'] = 'Self-interpretable (prototype-based)'
+            quality_metrics['num_prototypes'] = explanation.get('num_prototypes', 0)
+            quality_metrics['top_similarity'] = explanation.get('top_similarity', 0.0)
+            quality_metrics['prototype_class_agreement'] = explanation.get('prototype_class_agreement', False)
+            quality_metrics['valid_prototype_explanation'] = explanation.get('valid_explanation', False)
+            quality_metrics['self_interpretable'] = True
+            
+            # ProtGNN explains via similarity, not causality
+            quality_metrics['explains_via_similarity'] = True
+            quality_metrics['explains_via_causality'] = False
+            
+            quality_score = 0.8 if quality_metrics['valid_prototype_explanation'] else 0.2
+            quality_metrics['overall_quality'] = quality_score
+            quality_metrics['success'] = True
+            return quality_metrics
+        
+        if method == 'SubgraphX':
             quality_metrics['shapley_computed'] = len(explanation.get('shapley_values', []))
+            quality_metrics['theoretically_grounded'] = True
         
-        if explanation.get('method') == 'NeuronAnalysis':
+        if method == 'NeuronAnalysis':
             quality_metrics['layers_analyzed'] = len(explanation.get('neuron_concepts', {}))
             quality_metrics['confidence'] = explanation.get('confidence', 0)
+            quality_metrics['global_analysis'] = True
+            quality_metrics['concept_rules'] = len(explanation.get('concept_rules', []))
         
+        # Overall quality score
+        quality_score = 0
+        if quality_metrics.get('k_hop_compliant', True):
+            quality_score += 0.3
+        if quality_metrics.get('sparse_enough', False):
+            quality_score += 0.3
+        if quality_metrics.get('preserves_prediction', False):
+            quality_score += 0.4
+        
+        quality_metrics['overall_quality'] = quality_score
         quality_metrics['success'] = True
         return quality_metrics

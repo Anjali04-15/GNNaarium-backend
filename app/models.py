@@ -28,6 +28,13 @@ class GCN(torch.nn.Module):
             x = F.dropout(x, self.dropout, training=self.training)
             x = self.conv3(x, edge_index)
         return x
+    
+    def get_embeddings(self, x, edge_index, batch=None):
+        """Get intermediate embeddings for explainability"""
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.dropout(x, self.dropout, training=self.training)
+        embeddings = F.relu(self.conv2(x, edge_index))
+        return embeddings
 
 class GIN(torch.nn.Module):
     def __init__(self, in_channels, hidden_dim, out_channels, dropout=0.5, graph_level=False):
@@ -65,6 +72,11 @@ class GIN(torch.nn.Module):
             x = global_mean_pool(x, batch)
             x = self.classifier(x)
         return x
+    
+    def get_embeddings(self, x, edge_index, batch=None):
+        """Get intermediate embeddings for explainability"""
+        embeddings = F.relu(self.conv1(x, edge_index))
+        return embeddings
 
 class GAT(torch.nn.Module):
     def __init__(self, in_channels, hidden_dim, out_channels, dropout=0.5, heads=8, graph_level=False):
@@ -89,6 +101,12 @@ class GAT(torch.nn.Module):
             x = global_mean_pool(x, batch)
             x = self.classifier(x)
         return x
+    
+    def get_embeddings(self, x, edge_index, batch=None):
+        """Get intermediate embeddings for explainability"""
+        x = F.dropout(x, self.dropout, training=self.training)
+        embeddings = F.elu(self.conv1(x, edge_index))
+        return embeddings
 
 class GraphSage(torch.nn.Module):
     def __init__(self, in_channels, hidden_dim, out_channels, dropout=0.5, graph_level=False):
@@ -112,6 +130,11 @@ class GraphSage(torch.nn.Module):
             x = global_mean_pool(x, batch)
             x = self.classifier(x)
         return x
+    
+    def get_embeddings(self, x, edge_index, batch=None):
+        """Get intermediate embeddings for explainability"""
+        embeddings = F.relu(self.conv1(x, edge_index))
+        return embeddings
 
 class GraphTransformer(torch.nn.Module):
     def __init__(self, in_channels, hidden_dim, out_channels, dropout=0.5, heads=8, graph_level=False):
@@ -135,6 +158,11 @@ class GraphTransformer(torch.nn.Module):
             x = global_mean_pool(x, batch)
             x = self.classifier(x)
         return x
+    
+    def get_embeddings(self, x, edge_index, batch=None):
+        """Get intermediate embeddings for explainability"""
+        embeddings = F.relu(self.conv1(x, edge_index))
+        return embeddings
 
 class KAGNN(torch.nn.Module):
     def __init__(self, in_channels, hidden_dim, out_channels, dropout=0.5, k=3, graph_level=False):
@@ -170,6 +198,19 @@ class KAGNN(torch.nn.Module):
             x = global_mean_pool(x, batch)
             x = self.classifier(x)
         return x
+    
+    def get_embeddings(self, x, edge_index, batch=None):
+        """Get intermediate embeddings for explainability"""
+        # First GCN layer
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.dropout(x, self.dropout, training=self.training)
+        
+        # Knowledge-aware attention mechanism
+        x_reshaped = x.unsqueeze(1)
+        attn_output, _ = self.knowledge_attention(x_reshaped, x_reshaped, x_reshaped)
+        x_knowledge = self.knowledge_linear(attn_output.squeeze(1))
+        embeddings = x + x_knowledge
+        return embeddings
 
 # Model factory function for easy model selection
 def create_model(model_name, in_channels, hidden_dim, out_channels, dropout=0.5, graph_level=False, **kwargs):
