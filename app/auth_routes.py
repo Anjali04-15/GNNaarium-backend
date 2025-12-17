@@ -66,7 +66,7 @@ async def google_login(request: Request, redirect_to: str = None):
 
 @router.get("/auth/google/callback", name="google_callback")
 async def google_callback(request: Request):
-    FRONTEND_FALLBACK = "http://localhost:3000"
+    FRONTEND_FALLBACK = "https://gn-naarium-frontend.vercel.app"
     redirect_to = FRONTEND_FALLBACK
     try:
         if 'error' in request.query_params:
